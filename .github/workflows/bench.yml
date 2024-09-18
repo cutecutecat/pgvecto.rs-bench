@@ -1,0 +1,188 @@
+name: Run Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      organize:
+        type: string
+        required: true
+        default: 'tensorchord'
+      project:
+        type: string
+        required: true
+        default: 'pgvecto.rs'
+      branch:
+        type: string
+        required: true
+        default: 'main'
+      run_cli:
+        type: boolean
+        required: true
+        default: true
+      run_pyo3:
+        type: boolean
+        required: true
+        default: true
+      run_pg:
+        type: boolean
+        required: true
+        default: true
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      host: ${{ steps.fetch_host.outputs.host }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+      - run: terraform init
+        working-directory: ./terraform
+      - run: terraform apply -auto-approve
+        working-directory: ./terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - id: fetch_host
+        working-directory: ./terraform
+        run: |
+          HOST=$(terraform show -json | jq -r '.values.root_module.resources[] | select(.address == "aws_instance.web").values.public_dns')
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          sleep 20
+      - name: Upload terraform state
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-state
+          path: ./terraform/terraform.tfstate
+          retention-days: 1
+      - name: Remote SSH - init
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          HOST: ${{ steps.fetch_host.outputs.host }}
+          GITHUB_REPOSITORY_URL: https://github.com/${{ github.repository }}.git
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        with:
+          host: ${{ env.HOST }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PEM_KEY }}
+          envs: GITHUB_REPOSITORY_URL,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
+          script: |
+            git clone $GITHUB_REPOSITORY_URL
+            chmod -R +x $HOME/pgvecto.rs-bench/script/* $HOME/pgvecto.rs-bench/exp/*
+            $HOME/pgvecto.rs-bench/script/init.sh -o ${{ inputs.organize }} -p ${{ inputs.project }} -b ${{ inputs.branch }}
+  bench-cli:
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && inputs.run_cli }}
+    needs: prepare
+    strategy:
+      max-parallel: 1
+      matrix:
+        exps:
+          - {"name":"sift", "metric":"l2"}
+          - {"name":"gist", "metric":"l2"}
+          - {"name":"cohere", "metric":"l2"}
+          - {"name":"openai", "metric":"l2"}
+    steps:
+      - name: Remote SSH - Running CLI bench
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          HOST: ${{needs.prepare.outputs.host}}
+        with:
+          host: ${{ env.HOST }}
+          command_timeout: 1h
+          username: ubuntu
+          key: ${{ secrets.SSH_PEM_KEY }}
+          script: |
+            export BENCH_EXP_CLI=$HOME/pgvecto.rs-bench/exp/cli
+            $BENCH_EXP_CLI/prepare.sh -m ${{ matrix.exps.metric }} -n ${{ matrix.exps.name }}
+            $BENCH_EXP_CLI/build.sh -m ${{ matrix.exps.metric }} -n ${{ matrix.exps.name }}
+            $BENCH_EXP_CLI/bench.sh -m ${{ matrix.exps.metric }} -n ${{ matrix.exps.name }}
+            rm -rf $HOME/indexes/cli
+  bench-pyo3:
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && inputs.run_pyo3 }}
+    needs: [prepare, bench-cli]
+    strategy:
+      max-parallel: 1
+      matrix:
+        exps:
+          - {"name":"gist", "metric":"l2"}
+          - {"name":"sift", "metric":"l2"}
+          - {"name":"glove", "metric":"cos"}
+          - {"name":"cohere", "metric":"cos"}
+          - {"name":"openai", "metric":"cos"}
+          - {"name":"cohere", "metric":"l2"}
+          - {"name":"openai", "metric":"l2"}
+    steps:
+      - name: Remote SSH - Running CLI bench
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          HOST: ${{needs.prepare.outputs.host}}
+        with:
+          host: ${{ env.HOST }}
+          command_timeout: 1h
+          username: ubuntu
+          key: ${{ secrets.SSH_PEM_KEY }}
+          script: |
+            export BENCH_EXP_PYO3=$HOME/pgvecto.rs-bench/exp/pyo3
+            $BENCH_EXP_PYO3/prepare.sh -m ${{ matrix.exps.metric }} -n ${{ matrix.exps.name }}
+            $BENCH_EXP_PYO3/bench.sh -m ${{ matrix.exps.metric }} -n ${{ matrix.exps.name }}
+            rm -rf $HOME/indexes/pyo3
+  bench-pg:
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && inputs.run_pg }}
+    needs: [prepare, bench-pyo3]
+    strategy:
+      max-parallel: 1
+      matrix:
+        exps:
+          - {"name":"gist", "metric":"l2"}
+          - {"name":"sift", "metric":"l2"}
+          - {"name":"glove", "metric":"cos"}
+          - {"name":"cohere", "metric":"cos"}
+          - {"name":"openai", "metric":"cos"}
+          - {"name":"cohere", "metric":"l2"}
+          - {"name":"openai", "metric":"l2"}
+    steps:
+      - name: Remote SSH - Running PG bench
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          HOST: ${{needs.prepare.outputs.host}}
+        with:
+          host: ${{ env.HOST }}
+          command_timeout: 1h
+          username: ubuntu
+          key: ${{ secrets.SSH_PEM_KEY }}
+          script: |
+            export BENCH_EXP_PG=$HOME/pgvecto.rs-bench/exp/pg
+            $BENCH_EXP_PG/prepare.sh -m ${{ matrix.exps.metric }} -n ${{ matrix.exps.name }}
+            $BENCH_EXP_PG/bench.sh -m ${{ matrix.exps.metric }} -n ${{ matrix.exps.name }}
+  destroy:
+    needs: [bench-cli, bench-pyo3, bench-pg]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+      - run: terraform init
+        working-directory: ./terraform
+      - uses: actions/download-artifact@v4
+        with:
+          name: terraform-state
+          path: ./terraform
+      - run: terraform apply -destroy -auto-approve
+        working-directory: ./terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
